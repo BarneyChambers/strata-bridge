@@ -58,6 +58,15 @@ pub(in crate::mode) fn verify_timelock_ordering(params: &Params, config: &Config
         .context("unsafe params timelocks")
 }
 
+/// The proof predicates verify a witness. Runs even when `config.dev` skips the other checks,
+/// and does not look at the host, so a native host with no guest ELF is not a bypass.
+pub(in crate::mode) fn verify_proof_predicates(params: &Params) -> Result<()> {
+    params
+        .protocol
+        .validate_proof_predicates()
+        .context("unsafe proof predicate")
+}
+
 async fn fetch_asm_params(client: &HttpClient, config: &AsmRpcConfig) -> Result<AsmParams> {
     let timeout = config.request_timeout;
     let client = client.clone();
@@ -289,6 +298,8 @@ mod tests {
             contested_payout_timelock = 1_008
             unstaking_timelock = 2_016
             sweep_fee_rate = 10
+            bridge_proof_predicate = "NeverAccept"
+            counterproof_predicate = "NeverAccept"
             "#
         ))
         .expect("valid test params")
@@ -340,6 +351,19 @@ mod tests {
                 num_output_wires: 0,
             },
         }
+    }
+
+    #[test]
+    fn always_accept_predicate_fails_startup_even_without_a_host() {
+        let mut params = test_params();
+        verify_proof_predicates(&params).expect("NeverAccept is a real predicate");
+
+        params.protocol.bridge_proof_predicate = PredicateKey::always_accept();
+        let err = verify_proof_predicates(&params).unwrap_err().to_string();
+        assert!(
+            err.contains("bridge_proof_predicate is AlwaysAccept"),
+            "got: {err}"
+        );
     }
 
     #[test]

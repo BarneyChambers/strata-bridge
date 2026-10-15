@@ -13,7 +13,7 @@ use strata_bridge_primitives::{
     types::P2POperatorPubKey,
 };
 use strata_l1_txfmt::MagicBytes;
-use strata_predicate::PredicateKey;
+use strata_predicate::{PredicateKey, PredicateTypeId};
 
 /// The consensus-critical parameters that dictate the behavior of the bridge node.
 ///
@@ -111,11 +111,16 @@ pub struct ProtocolParams {
     pub unstaking_timelock: u16,
 
     /// Predicate key used to verify bridge proof.
-    #[serde(default = "PredicateKey::always_accept")]
+    ///
+    /// Required. `AlwaysAccept` is rejected: it verifies every witness, so a receipt can name
+    /// the expected claim and set `total_pow` to anything.
+    #[serde(deserialize_with = "deserialize_bridge_proof_predicate")]
     pub bridge_proof_predicate: PredicateKey,
 
     /// Predicate key used to verify bridge counterproof.
-    #[serde(default = "PredicateKey::always_accept")]
+    ///
+    /// Required, and not `AlwaysAccept`, for the same reason as `bridge_proof_predicate`.
+    #[serde(deserialize_with = "deserialize_counterproof_predicate")]
     pub counterproof_predicate: PredicateKey,
 }
 
@@ -154,6 +159,17 @@ impl ProtocolParams {
             });
         }
 
+        Ok(())
+    }
+
+    /// Rejects a predicate that verifies every witness.
+    ///
+    /// A missing key never reaches this: both fields are required on the TOML. This catches a
+    /// `Params` value built in code, including one passed to a node that skipped other startup
+    /// checks.
+    pub fn validate_proof_predicates(&self) -> Result<(), ProofPredicateError> {
+        reject_always_accept("bridge_proof_predicate", &self.bridge_proof_predicate)?;
+        reject_always_accept("counterproof_predicate", &self.counterproof_predicate)?;
         Ok(())
     }
 }
@@ -202,6 +218,51 @@ pub enum TimelockOrderingError {
         /// The configured contested payout timelock.
         contested_payout: u16,
     },
+}
+
+/// A proof predicate that does not verify a witness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ProofPredicateError {
+    /// `AlwaysAccept` returns success for every claim and every witness.
+    #[error("{field} is AlwaysAccept, which verifies any witness")]
+    AlwaysAccept {
+        /// `bridge_proof_predicate` or `counterproof_predicate`.
+        field: &'static str,
+    },
+}
+
+fn reject_always_accept(field: &'static str, key: &PredicateKey) -> Result<(), ProofPredicateError> {
+    // A non-empty condition does not change the verifier: AlwaysAccept ignores it.
+    if key.id() == PredicateTypeId::AlwaysAccept.as_u8() {
+        return Err(ProofPredicateError::AlwaysAccept { field });
+    }
+    Ok(())
+}
+
+fn deserialize_bridge_proof_predicate<'de, D>(deserializer: D) -> Result<PredicateKey, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_verifying_predicate("bridge_proof_predicate", deserializer)
+}
+
+fn deserialize_counterproof_predicate<'de, D>(deserializer: D) -> Result<PredicateKey, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_verifying_predicate("counterproof_predicate", deserializer)
+}
+
+fn deserialize_verifying_predicate<'de, D>(
+    field: &'static str,
+    deserializer: D,
+) -> Result<PredicateKey, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let key = PredicateKey::deserialize(deserializer)?;
+    reject_always_accept(field, &key).map_err(serde::de::Error::custom)?;
+    Ok(key)
 }
 
 /// The keys used by the operators.
@@ -671,8 +732,60 @@ mod tests {
             nack_timelock = 144
             contested_payout_timelock = 1_008
             unstaking_timelock = 2_016
+            bridge_proof_predicate = "NeverAccept"
+            counterproof_predicate = "NeverAccept"
     "#
         )
+    }
+
+    #[test]
+    fn missing_proof_predicate_is_rejected() {
+        let params = params_toml(&valid_admin_section())
+            .replace("bridge_proof_predicate = \"NeverAccept\"\n", "");
+        let err = toml::from_str::<Params>(&params).unwrap_err().to_string();
+        assert!(
+            err.contains("missing field `bridge_proof_predicate`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn always_accept_proof_predicate_is_rejected() {
+        for value in ["AlwaysAccept", "AlwaysAccept:ff"] {
+            let params = params_toml(&valid_admin_section()).replace(
+                "bridge_proof_predicate = \"NeverAccept\"",
+                &format!("bridge_proof_predicate = \"{value}\""),
+            );
+            let err = toml::from_str::<Params>(&params).unwrap_err().to_string();
+            assert!(
+                err.contains("bridge_proof_predicate is AlwaysAccept"),
+                "value {value}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_built_always_accept_predicate_is_rejected() {
+        let mut params = toml::from_str::<Params>(&params_toml(&valid_admin_section())).unwrap();
+        params.protocol.bridge_proof_predicate = PredicateKey::always_accept();
+        let err = params.protocol.validate_proof_predicates().unwrap_err();
+        assert_eq!(
+            err,
+            ProofPredicateError::AlwaysAccept {
+                field: "bridge_proof_predicate"
+            }
+        );
+
+        params.protocol.bridge_proof_predicate = PredicateKey::never_accept();
+        params.protocol.counterproof_predicate =
+            PredicateKey::try_new(PredicateTypeId::AlwaysAccept, vec![0xff]).unwrap();
+        let err = params.protocol.validate_proof_predicates().unwrap_err();
+        assert_eq!(
+            err,
+            ProofPredicateError::AlwaysAccept {
+                field: "counterproof_predicate"
+            }
+        );
     }
 
     #[test]
@@ -716,6 +829,8 @@ mod tests {
             ack_timelock = 144
             nack_timelock = 144
             contested_payout_timelock = 1_008
+            bridge_proof_predicate = "NeverAccept"
+            counterproof_predicate = "NeverAccept"
             "#
         );
 
