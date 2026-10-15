@@ -489,4 +489,88 @@ mod tests {
             assert!(err.contains("expected exactly one"), "got: {err}");
         }
     }
+
+    #[test]
+    fn docker_native_keys_match_the_params_predicates() {
+        use std::path::PathBuf;
+
+        use bitcoin::hashes::{Hash, sha256};
+        use secp256k1::{Keypair, Message, Secp256k1};
+        use strata_bridge_primitives::proof::verify_bridge_proof;
+        use strata_predicate::PredicateTypeId;
+        use zkaleido::{Proof, ProofReceipt, PublicValues};
+
+        use crate::config::ProofBackendConfig;
+
+        fn native_key(backend: &ProofBackendConfig) -> (Vec<u8>, Vec<u8>) {
+            match backend {
+                ProofBackendConfig::Native {
+                    schnorr_signing_key,
+                } => (
+                    schnorr_signing_key.verifying_key().to_bytes().to_vec(),
+                    schnorr_signing_key.to_bytes().to_vec(),
+                ),
+                #[cfg(feature = "sp1")]
+                ProofBackendConfig::Sp1 { .. } => panic!("docker proof backend is native"),
+            }
+        }
+
+        fn signed(secret: &[u8], claim: &[u8]) -> ProofReceipt {
+            let secp = Secp256k1::new();
+            let keypair = Keypair::from_seckey_slice(&secp, secret).unwrap();
+            let digest: [u8; 32] = sha256::Hash::hash(claim).to_byte_array();
+            let sig = secp.sign_schnorr(&Message::from_digest(digest), &keypair);
+            ProofReceipt::new(
+                Proof::new(sig.as_ref().to_vec()),
+                PublicValues::new(claim.to_vec()),
+            )
+        }
+
+        let claim = b"docker-native-bridge-proof";
+        for n in 1..=3 {
+            let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../../docker/vol/strata-bridge-{n}"));
+            let params = Params::from_path(dir.join("params.toml")).unwrap();
+            let config: Config =
+                toml::from_str(&std::fs::read_to_string(dir.join("config.toml")).unwrap()).unwrap();
+            verify_proof_predicates(&params).unwrap();
+
+            let (bridge_xonly, bridge_secret) = native_key(&config.bridge_proof);
+            let (counter_xonly, counter_secret) = native_key(&config.counterproof);
+            let bridge_predicate =
+                PredicateKey::try_new(PredicateTypeId::Bip340Schnorr, bridge_xonly).unwrap();
+            let counter_predicate =
+                PredicateKey::try_new(PredicateTypeId::Bip340Schnorr, counter_xonly).unwrap();
+            assert_eq!(
+                params.protocol.bridge_proof_predicate.id(),
+                bridge_predicate.id(),
+                "node {n} bridge predicate"
+            );
+            assert_eq!(
+                params.protocol.bridge_proof_predicate.condition(),
+                bridge_predicate.condition(),
+                "node {n} bridge predicate"
+            );
+            assert_eq!(
+                params.protocol.counterproof_predicate.id(),
+                counter_predicate.id(),
+                "node {n} counterproof predicate"
+            );
+            assert_eq!(
+                params.protocol.counterproof_predicate.condition(),
+                counter_predicate.condition(),
+                "node {n} counterproof predicate"
+            );
+
+            let bridge_receipt = signed(&bridge_secret, claim);
+            assert!(verify_bridge_proof(
+                &params.protocol.bridge_proof_predicate,
+                &bridge_receipt
+            ));
+            assert!(!verify_bridge_proof(
+                &params.protocol.bridge_proof_predicate,
+                &signed(&counter_secret, claim)
+            ));
+        }
+    }
 }
