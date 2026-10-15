@@ -359,10 +359,12 @@ mod tests {
         verify_proof_predicates(&params).expect("NeverAccept is a real predicate");
 
         params.protocol.bridge_proof_predicate = PredicateKey::always_accept();
-        let err = verify_proof_predicates(&params).unwrap_err().to_string();
+        let err = verify_proof_predicates(&params).unwrap_err();
+        // anyhow's Display is only the context. The cause is the predicate error.
+        let full = format!("{err:#}");
         assert!(
-            err.contains("bridge_proof_predicate is AlwaysAccept"),
-            "got: {err}"
+            full.contains("bridge_proof_predicate is AlwaysAccept"),
+            "got: {full}"
         );
     }
 
