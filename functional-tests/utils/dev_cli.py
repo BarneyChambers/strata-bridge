@@ -1,7 +1,7 @@
 import os
 import subprocess
 import tempfile
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import toml
 
@@ -11,6 +11,10 @@ from factory.bridge_operator.params_cfg import (
     BridgeProtocolParams,
     Keys,
     ScheduledOperator,
+)
+from factory.bridge_operator.utils import (
+    resolve_bridge_proof_predicate,
+    resolve_counterproof_predicate,
 )
 from rpc.asm_types import CheckpointTip
 from utils.utils import OperatorKeyInfo
@@ -45,6 +49,12 @@ class DevCli:
 
     def _create_params_file(self) -> str:
         p = self.bridge_protocol_params or BridgeProtocolParams()
+        # Same fill as generate_params_toml. A missing key used to deserialize as
+        # AlwaysAccept; the node now rejects that, so the CLI copy must name one.
+        if p.bridge_proof_predicate is None:
+            p = replace(p, bridge_proof_predicate=resolve_bridge_proof_predicate())
+        if p.counterproof_predicate is None:
+            p = replace(p, counterproof_predicate=resolve_counterproof_predicate())
 
         operators = [
             ScheduledOperator(

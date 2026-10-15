@@ -28,6 +28,7 @@ use strata_bridge_proof_common::prove;
 use strata_bridge_tx_graph::transactions::counterproof::CounterproofTx;
 use strata_identifiers::Buf32;
 use strata_mosaic_client_api::types::{G16ProofRaw, N_WITHDRAWAL_INPUT_WIRES, Role};
+use strata_predicate::PredicateKey;
 use tracing::{info, warn};
 use zkaleido::ProofReceipt;
 #[cfg(feature = "sp1")]
@@ -65,21 +66,25 @@ pub(super) async fn evaluate_and_publish_counterproof(
     );
 
     let mode = 'select_mode: {
-        let Ok(output) = BridgeProofOutput::from_ssz_bytes(proof.public_values().as_bytes()) else {
-            info!(%deposit_idx, %operator_idx, %game_index, "bridge proof output doesn't parse; publishing counterproof");
-            break 'select_mode CounterproofMode::InvalidBridgeProof;
-        };
-
-        if (output.claim_unlock.deposit_idx != game_index.get() - 1)
-            || (output.claim_unlock.operator_pubkey != operator_pubkey)
-        {
-            info!(%deposit_idx, %operator_idx, %game_index, "bridge proof commits to a different game; publishing counterproof");
-            break 'select_mode CounterproofMode::InvalidBridgeProof;
-        }
-
-        if !verify_bridge_proof(&cfg.graph_sm_cfg.bridge_proof_predicate, &proof) {
-            info!(%deposit_idx, %operator_idx, %game_index, "bridge proof failed verification; publishing counterproof");
-            break 'select_mode CounterproofMode::InvalidBridgeProof;
+        match classify_bridge_proof(
+            &cfg.graph_sm_cfg.bridge_proof_predicate,
+            &proof,
+            game_index,
+            operator_pubkey,
+        ) {
+            ObservedBridgeProof::Unparseable => {
+                info!(%deposit_idx, %operator_idx, %game_index, "bridge proof output doesn't parse; publishing counterproof");
+                break 'select_mode CounterproofMode::InvalidBridgeProof;
+            }
+            ObservedBridgeProof::WrongGame => {
+                info!(%deposit_idx, %operator_idx, %game_index, "bridge proof commits to a different game; publishing counterproof");
+                break 'select_mode CounterproofMode::InvalidBridgeProof;
+            }
+            ObservedBridgeProof::Unverified => {
+                info!(%deposit_idx, %operator_idx, %game_index, "bridge proof failed verification; publishing counterproof");
+                break 'select_mode CounterproofMode::InvalidBridgeProof;
+            }
+            ObservedBridgeProof::Verified => {}
         }
 
         let Some(heavier_chain_proof) = detect_heavier_chain(
@@ -497,6 +502,37 @@ async fn fetch_moho_proof(
     ))
 }
 
+/// What the observed bridge proof is, before the heavier-chain lookup.
+///
+/// `Verified` is the only arm that can take the "nothing to challenge" skip.
+/// `AlwaysAccept` stays `Unverified`, including when `total_pow` is all `0xff`.
+enum ObservedBridgeProof {
+    Unparseable,
+    WrongGame,
+    Unverified,
+    Verified,
+}
+
+fn classify_bridge_proof(
+    predicate: &PredicateKey,
+    proof: &ProofReceipt,
+    game_index: NonZero<u32>,
+    operator_pubkey: Buf32,
+) -> ObservedBridgeProof {
+    let Ok(output) = BridgeProofOutput::from_ssz_bytes(proof.public_values().as_bytes()) else {
+        return ObservedBridgeProof::Unparseable;
+    };
+    if output.claim_unlock.deposit_idx != game_index.get() - 1
+        || output.claim_unlock.operator_pubkey != operator_pubkey
+    {
+        return ObservedBridgeProof::WrongGame;
+    }
+    if !verify_bridge_proof(predicate, proof) {
+        return ObservedBridgeProof::Unverified;
+    }
+    ObservedBridgeProof::Verified
+}
+
 fn counterproof_operator_keys(
     operator_table: &OperatorTable,
     operator_idx: OperatorIdx,
@@ -545,6 +581,74 @@ mod tests {
         let claim_unlock = OperatorClaimUnlockV1::new(7, Buf32(operator_pubkey.serialize()));
         let committed_bytes = ssz::Encode::as_ssz_bytes(&claim_unlock);
         assert_eq!(claim_unlock.compute_hash(), hash::raw(&committed_bytes).0);
+    }
+
+    #[test]
+    fn always_accept_max_pow_receipt_is_not_verified() {
+        use bitcoin::hashes::{Hash, sha256};
+        use musig2::secp256k1::{Keypair, Message, Secp256k1};
+        use strata_predicate::PredicateTypeId;
+        use zkaleido::{Proof, PublicValues};
+
+        let table = test_operator_table(3, 0);
+        let operator_idx = 1;
+        let operator_pubkey = Buf32(
+            table
+                .idx_to_btc_x_only_key(&operator_idx)
+                .unwrap()
+                .serialize(),
+        );
+        let game_index = NonZero::new(1).unwrap();
+        let output = BridgeProofOutput {
+            total_pow: [0xff; 32],
+            claim_unlock: OperatorClaimUnlockV1::new(game_index.get() - 1, operator_pubkey),
+            mmr_idx: 0,
+        };
+        let claim = ssz::Encode::as_ssz_bytes(&output);
+        let empty = ProofReceipt::new(Proof::new(vec![]), PublicValues::new(claim.clone()));
+
+        // This is the HACK-05 receipt: the claim names this game and the pow is above any
+        // real chain. AlwaysAccept used to verify it, and the heavier-chain check then skipped.
+        let verdict = classify_bridge_proof(
+            &PredicateKey::always_accept(),
+            &empty,
+            game_index,
+            operator_pubkey,
+        );
+        assert!(
+            matches!(verdict, ObservedBridgeProof::Unverified),
+            "an AlwaysAccept receipt must not reach the heavier-chain skip"
+        );
+
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[0x11; 32]).unwrap();
+        let digest: [u8; 32] = sha256::Hash::hash(&claim).to_byte_array();
+        let sig = secp.sign_schnorr(&Message::from_digest(digest), &keypair);
+        let signed = ProofReceipt::new(
+            Proof::new(sig.as_ref().to_vec()),
+            PublicValues::new(claim.clone()),
+        );
+        let predicate = PredicateKey::try_new(
+            PredicateTypeId::Bip340Schnorr,
+            keypair.x_only_public_key().0.serialize().to_vec(),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                classify_bridge_proof(&predicate, &signed, game_index, operator_pubkey),
+                ObservedBridgeProof::Verified
+            ),
+            "the same claim under its Schnorr key is a verified proof"
+        );
+        assert!(matches!(
+            classify_bridge_proof(
+                &PredicateKey::always_accept(),
+                &signed,
+                game_index,
+                operator_pubkey
+            ),
+            ObservedBridgeProof::Unverified
+        ));
     }
 
     #[test]
